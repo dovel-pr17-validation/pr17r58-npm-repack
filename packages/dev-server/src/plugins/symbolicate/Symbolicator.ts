@@ -1,0 +1,270 @@
+import { URL } from 'node:url';
+import { codeFrameColumns } from '@babel/code-frame';
+import type { FastifyBaseLogger } from 'fastify';
+import { SourceMapConsumer } from 'source-map';
+import {
+  decodeSourceName,
+  escapeSourceName,
+  isGeneratedBundleFrame,
+  isSymbolicatableFrame,
+  prepareSourceMap,
+} from '../../utils/symbolication.js';
+import type {
+  CodeFrame,
+  InputStackFrame,
+  ReactNativeStackFrame,
+  StackFrame,
+  SymbolicatorDelegate,
+  SymbolicatorResults,
+} from './types.js';
+
+/**
+ * Class for transforming stack traces from React Native application with using Source Map.
+ * Raw stack frames produced by React Native, points to some location from the bundle
+ * eg `index.bundle?platform=ios:567:1234`. By using Source Map for that bundle `Symbolicator`
+ * produces frames that point to source code inside your project eg `Hello.tsx:10:9`.
+ */
+export class Symbolicator {
+  /**
+   * Infer platform from stack frames.
+   * Usually at least one frame has `file` field with the bundle URL eg:
+   * `http://localhost:8081/index.bundle?platform=ios&...`, which can be used to infer platform.
+   *
+   * @param stack Array of stack frames.
+   * @returns Inferred platform or `undefined` if cannot infer.
+   */
+  static inferPlatformFromStack(stack: ReactNativeStackFrame[]) {
+    for (const frame of stack) {
+      if (!frame.file) {
+        continue;
+      }
+
+      const { searchParams, pathname } = new URL(frame.file, 'file://');
+      const platform = searchParams.get('platform');
+      if (platform) {
+        return platform;
+      }
+      const [bundleFilename] = pathname.split('/').reverse();
+      const [, platformOrExtension, extension] = bundleFilename.split('.');
+      if (extension) {
+        return platformOrExtension;
+      }
+    }
+  }
+
+  /**
+   * Constructs new `Symbolicator` instance.
+   *
+   * @param delegate Delegate instance with symbolication functions.
+   */
+  constructor(private delegate: SymbolicatorDelegate) {}
+
+  /**
+   * Process raw React Native stack frames and transform them using Source Maps.
+   * Method will try to symbolicate as much data as possible, but if the Source Maps
+   * are not available, invalid or the original positions/data is not found in Source Maps,
+   * the method will return raw values - the same as supplied with `stack` parameter.
+   * For example out of 10 frames, it's possible that only first 7 will be symbolicated and the
+   * remaining 3 will be unchanged.
+   *
+   * @param logger Fastify logger instance.
+   * @param stack Raw stack frames.
+   * @returns Symbolicated stack frames.
+   */
+  async process(
+    logger: FastifyBaseLogger,
+    stack: ReactNativeStackFrame[]
+  ): Promise<SymbolicatorResults> {
+    logger.debug({ msg: 'Filtering out unnecessary frames' });
+
+    const frames = stack.filter(isSymbolicatableFrame);
+
+    // A Symbolicator instance is shared by the route. Keep consumers local to
+    // one request so concurrent call-stack and component-stack requests cannot
+    // destroy or read each other's source maps.
+    const sourceMapConsumers = new Map<string, SourceMapConsumer>();
+    try {
+      logger.debug({ msg: 'Processing frames', frames });
+
+      const processedFrames: StackFrame[] = [];
+      for (const frame of frames) {
+        try {
+          if (!sourceMapConsumers.has(frame.file)) {
+            logger.debug({
+              msg: 'Loading raw source map data',
+              fileUrl: frame.file,
+            });
+
+            const rawSourceMap = await this.delegate.getSourceMap(frame.file);
+
+            logger.debug({
+              msg: 'Creating source map instance',
+              fileUrl: frame.file,
+              sourceMapLength: rawSourceMap.length,
+            });
+            const sourceMapConsumer = await new SourceMapConsumer(
+              prepareSourceMap(rawSourceMap)
+            );
+
+            logger.debug({
+              msg: 'Saving source map instance into cache',
+              fileUrl: frame.file,
+            });
+            sourceMapConsumers.set(frame.file, sourceMapConsumer);
+          }
+
+          logger.debug({
+            msg: 'Symbolicating frame',
+            frame,
+          });
+          const processedFrame = this.processFrame(frame, sourceMapConsumers);
+
+          logger.debug({
+            msg: 'Finished symbolicating frame',
+            frame,
+          });
+          processedFrames.push(processedFrame);
+        } catch (error) {
+          // Match Metro's best-effort behavior: one unavailable or malformed
+          // source map must not discard frames that can still be symbolicated.
+          logger.debug({
+            msg: 'Failed to symbolicate frame',
+            fileUrl: frame.file,
+            error: (error as Error).message,
+          });
+          processedFrames.push({ ...frame, collapse: false });
+        }
+      }
+
+      const codeFrame =
+        (await this.getCodeFrame(
+          logger,
+          processedFrames,
+          frames,
+          sourceMapConsumers
+        )) ?? null;
+
+      logger.debug({
+        msg: 'Finished symbolicating frames',
+        processedFrames,
+        codeFrame,
+      });
+
+      return { stack: processedFrames, codeFrame };
+    } finally {
+      for (const consumer of sourceMapConsumers.values()) {
+        consumer.destroy();
+      }
+    }
+  }
+
+  private processFrame(
+    frame: InputStackFrame,
+    sourceMapConsumers: Map<string, SourceMapConsumer>
+  ): StackFrame {
+    if (frame.lineNumber == null || frame.column == null) {
+      return {
+        ...frame,
+        collapse: false,
+      };
+    }
+
+    const consumer = sourceMapConsumers.get(frame.file);
+    if (!consumer) {
+      return {
+        ...frame,
+        collapse: false,
+      };
+    }
+
+    let lookup = consumer.originalPositionFor({
+      line: frame.lineNumber,
+      column: frame.column,
+      bias: SourceMapConsumer.LEAST_UPPER_BOUND,
+    });
+
+    if (!lookup.source) {
+      // fallback to GREATEST_LOWER_BOUND
+      lookup = consumer.originalPositionFor({
+        line: frame.lineNumber,
+        column: frame.column,
+        bias: SourceMapConsumer.GREATEST_LOWER_BOUND,
+      });
+    }
+
+    // return the original frame when both lookups fail
+    if (!lookup.source) {
+      return {
+        ...frame,
+        collapse: false,
+      };
+    }
+
+    return {
+      lineNumber: lookup.line ?? frame.lineNumber,
+      column: lookup.column ?? frame.column,
+      file: decodeSourceName(lookup.source),
+      methodName: lookup.name || frame.methodName,
+      collapse: false,
+    };
+  }
+
+  private async getCodeFrame(
+    logger: FastifyBaseLogger,
+    processedFrames: StackFrame[],
+    inputFrames: InputStackFrame[],
+    sourceMapConsumers: Map<string, SourceMapConsumer>
+  ): Promise<CodeFrame | undefined> {
+    for (const [index, frame] of processedFrames.entries()) {
+      if (frame.collapse || frame.lineNumber == null || frame.column == null) {
+        continue;
+      }
+
+      if (isGeneratedBundleFrame(frame)) {
+        continue;
+      }
+
+      if (!this.delegate.shouldIncludeFrame(frame)) {
+        return undefined;
+      }
+
+      logger.debug({
+        msg: 'Generating code frame',
+        frame,
+      });
+
+      try {
+        const consumer = sourceMapConsumers.get(inputFrames[index]?.file);
+        const embeddedSource = consumer?.sourceContentFor(
+          escapeSourceName(frame.file),
+          true
+        );
+        const source =
+          embeddedSource ??
+          (await this.delegate.getSource(frame.file)).toString();
+
+        return {
+          content: codeFrameColumns(
+            source,
+            {
+              start: { column: frame.column, line: frame.lineNumber },
+            },
+            { forceColor: true }
+          ),
+          location: {
+            row: frame.lineNumber,
+            column: frame.column,
+          },
+          fileName: frame.file,
+        };
+      } catch (error) {
+        logger.error({
+          msg: 'Failed to create code frame',
+          error: (error as Error).message,
+        });
+      }
+
+      return undefined;
+    }
+  }
+}

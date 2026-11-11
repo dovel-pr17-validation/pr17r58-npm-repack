@@ -1,0 +1,188 @@
+import type { TransformOptions } from '@babel/core';
+import type {
+  LoaderContext,
+  RawSourceMap,
+  SwcLoaderOptions,
+} from '@rspack/core';
+import { transform } from '../babelLoader/babelLoader.js';
+import { normalizeInputSourceMap } from '../babelLoader/utils.js';
+import type { BabelSwcLoaderOptions } from './options.js';
+import {
+  addSwcComplementaryTransforms,
+  getSupportedSwcConfigurableTransforms,
+  getSupportedSwcCustomTransforms,
+  getSupportedSwcNormalTransforms,
+} from './swc.js';
+import {
+  checkParallelModeAvailable,
+  getExtraBabelPlugins,
+  getProjectBabelConfig,
+  getProjectRootPath,
+  getSwcParserConfig,
+  lazyGetSwc,
+} from './utils.js';
+
+type BabelTransform = [string, Record<string, any> | undefined];
+
+export const raw = false;
+
+export function partitionTransforms(
+  filename: string,
+  babelTransforms: BabelTransform[]
+) {
+  let normalTransforms: string[] = [];
+  let configurableTransforms: string[] = [];
+  let customTransforms: string[] = [];
+
+  let swcConfig: SwcLoaderOptions = {
+    jsc: {
+      parser: getSwcParserConfig(filename),
+      transform: { react: { useBuiltins: true } },
+    },
+  };
+
+  const swcTransforms = addSwcComplementaryTransforms(babelTransforms);
+
+  normalTransforms = getSupportedSwcNormalTransforms(swcTransforms);
+  ({ swcConfig, transformNames: configurableTransforms } =
+    getSupportedSwcConfigurableTransforms(swcTransforms, swcConfig));
+  ({ swcConfig, transformNames: customTransforms } =
+    getSupportedSwcCustomTransforms(swcTransforms, swcConfig));
+
+  const includedSwcTransforms: string[] = [
+    ...normalTransforms,
+    ...configurableTransforms,
+  ];
+
+  const supportedSwcTransforms: string[] = [
+    ...includedSwcTransforms,
+    ...customTransforms,
+  ];
+
+  return { includedSwcTransforms, supportedSwcTransforms, swcConfig };
+}
+
+export interface BuildFinalSwcConfigOptions {
+  swcConfig: SwcLoaderOptions;
+  includedSwcTransforms: string[];
+  lazyImports: boolean | string[];
+  sourceType: 'module' | 'script' | undefined;
+}
+
+export function buildFinalSwcConfig(
+  options: BuildFinalSwcConfigOptions
+): SwcLoaderOptions {
+  const { swcConfig, includedSwcTransforms, lazyImports, sourceType } = options;
+  return {
+    ...swcConfig,
+    // set env based on babel transforms
+    env: {
+      // node supports everything and does not include
+      // any transforms by default, so it can as a template
+      targets: { node: 24 },
+      include: includedSwcTransforms,
+    },
+    // set lazy imports based on loader options
+    module: {
+      ...swcConfig.module,
+      lazy: lazyImports,
+      // if type is not set, this means that we are not using
+      // transform-modules-commonjs babel plugin, which can be disabled
+      // in babel config through `disableImportExportTransform` option in the RN preset
+      // we use 'es6' as a fallback here to achieve the desired behaviour of
+      // keeping ES modules as they are found in the source code
+      type: swcConfig.module?.type ?? 'es6',
+    },
+    isModule: sourceType === 'module',
+  };
+}
+
+export default async function babelSwcLoader(
+  this: LoaderContext<BabelSwcLoaderOptions>,
+  source: string,
+  sourceMap: string | RawSourceMap | undefined
+) {
+  this.cacheable();
+  const callback = this.async();
+  const logger = this.getLogger('BabelSwcLoader');
+  const options = this.getOptions();
+
+  if (!options.hideParallelModeWarning) {
+    checkParallelModeAvailable(this, logger);
+  }
+
+  const lazyImports = options.lazyImports ?? false;
+  const projectRoot = getProjectRootPath(this);
+
+  const withSourceMaps = this.resourcePath.match(/node_modules/)
+    ? false
+    : this.sourceMap;
+
+  try {
+    const baseBabelConfig: TransformOptions = {
+      caller: { name: '@callstack/repack' },
+      root: projectRoot,
+      filename: this.resourcePath,
+      sourceMaps: withSourceMaps,
+      sourceFileName: this.resourcePath,
+      inputSourceMap: withSourceMaps
+        ? normalizeInputSourceMap(sourceMap)
+        : undefined,
+      ...options.babelOverrides,
+    };
+
+    const swc = await lazyGetSwc(this);
+    // if swc is not available, use babel to transform everything
+    if (!swc) {
+      const { code, map } = await transform(source, baseBabelConfig, {
+        hermesParserPath: options.hermesParserPath,
+        hermesParserOverrides: options.hermesParserOverrides,
+      });
+      callback(null, code ?? undefined, map ?? undefined);
+      return;
+    }
+
+    const babelConfig = getProjectBabelConfig(this.resourcePath, projectRoot);
+    const detectedBabelTransforms =
+      babelConfig.plugins?.map((p) => [p.key, p.options] as BabelTransform) ??
+      [];
+
+    const includeBabelPlugins = getExtraBabelPlugins(this.resourcePath);
+    const { includedSwcTransforms, supportedSwcTransforms, swcConfig } =
+      partitionTransforms(this.resourcePath, detectedBabelTransforms);
+
+    const babelResult = await transform(source, baseBabelConfig, {
+      excludePlugins: supportedSwcTransforms,
+      includePlugins: includeBabelPlugins,
+      hermesParserPath: options.hermesParserPath,
+      hermesParserOverrides: options.hermesParserOverrides,
+    });
+
+    const finalSwcConfig = buildFinalSwcConfig({
+      swcConfig,
+      includedSwcTransforms,
+      lazyImports,
+      sourceType: babelResult.sourceType,
+    });
+
+    const swcResult = swc.transformSync(babelResult.code!, {
+      ...finalSwcConfig,
+      caller: { name: '@callstack/repack' },
+      filename: this.resourcePath,
+      configFile: false,
+      swcrc: false,
+      root: projectRoot ?? babelConfig.root ?? undefined,
+      minify: false,
+      sourceMaps: withSourceMaps,
+      inputSourceMap: withSourceMaps
+        ? JSON.stringify(babelResult?.map)
+        : undefined,
+      sourceFileName: this.resourcePath,
+      ...options.swcOverrides,
+    });
+
+    callback(null, swcResult?.code, swcResult?.map);
+  } catch (error) {
+    callback(error as Error);
+  }
+}

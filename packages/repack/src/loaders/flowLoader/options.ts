@@ -1,0 +1,32 @@
+import type { LoaderContext } from '@rspack/core';
+import { validate } from 'schema-utils';
+
+export interface FlowLoaderOptions {
+  all?: boolean;
+  ignoreUninitializedFields?: boolean;
+  pretty?: boolean;
+  removeEmptyImports?: boolean;
+}
+
+type Schema = Parameters<typeof validate>[0];
+
+export const optionsSchema: Schema = {
+  type: 'object',
+  required: [],
+  properties: {
+    all: { type: 'boolean' },
+    ignoreUninitializedFields: { type: 'boolean' },
+    pretty: { type: 'boolean' },
+    removeEmptyImports: { type: 'boolean' },
+  },
+};
+
+export function getOptions(
+  loaderContext: LoaderContext<FlowLoaderOptions>
+): FlowLoaderOptions {
+  const options = loaderContext.getOptions() || {};
+
+  validate(optionsSchema, options, { name: 'repackFlowLoader' });
+
+  return options;
+}

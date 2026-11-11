@@ -1,0 +1,31 @@
+const Repack = require('@callstack/repack');
+
+/**
+ * Rspack configuration enhanced with Re.Pack defaults for React Native.
+ *
+ * Learn about Rspack configuration: https://rspack.rs/config/
+ * Learn about Re.Pack configuration: https://re-pack.dev/docs/guides/configuration
+ */
+
+module.exports = Repack.defineRspackConfig({
+  context: __dirname,
+  entry: './index.js',
+  resolve: {
+    ...Repack.getResolveOptions({ enablePackageExports: true }),
+  },
+  module: {
+    rules: [
+      {
+        test: /\.[cm]?[jt]sx?$/,
+        type: 'javascript/auto',
+        use: {
+          loader: '@callstack/repack/babel-swc-loader',
+          parallel: true,
+          options: {},
+        },
+      },
+      ...Repack.getAssetTransformRules(),
+    ],
+  },
+  plugins: [new Repack.RepackPlugin()],
+});

@@ -1,0 +1,181 @@
+# Remote assets
+
+Re.Pack provides you with a way to extract and serve your assets externally, such as on a CDN,
+instead of bundling them directly into your application. When working with ModuleFederation
+this is the recommended approach to handling the assets in federated modules, as inlining
+the assets causes your bundle size to increase dramatically.
+
+:::tip Use remote assets only in production
+During development, it's best to disable remote assets and load them locally. When you're ready to move to production, you can use `enabled: true` and then upload the assets to the CDN of your choosing.
+:::
+
+## Usage
+
+To convert assets to remote assets you have to configure `remote` option in the [Assets loader](/api/loaders/assets-loader):
+
+```js title="rspack.config.cjs"
+const Repack = require("@callstack/repack");
+
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: Repack.getAssetExtensionsRegExp(),
+        use: {
+          loader: "@callstack/repack/assets-loader",
+          options: {
+            remote: {
+              enabled: true,
+              publicPath: "http://localhost:9999",
+            },
+          },
+        },
+      },
+    ],
+  },
+};
+```
+
+You can also use the remote assets configuration with [getAssetTransformRules](/api/utils/get-asset-transform-rules) helper function:
+
+```js title="rspack.config.cjs"
+const Repack = require("@callstack/repack");
+
+module.exports = {
+  module: {
+    rules: [
+      ...Repack.getAssetTransformRules({
+        remote: {
+          enabled: true,
+          publicPath: "http://localhost:9999",
+        },
+      }),
+    ],
+  },
+};
+```
+
+Remote assets are imported in the same way as local assets:
+
+```jsx
+import image from './image.png';
+<Image source={image} />
+// or
+<Image source={require('./image.png')} />
+```
+
+In both cases shown above, the value of `source` prop will resolve to an object of shape:
+
+```ts
+type Source = {
+  uri: string;
+  width: number;
+  height: number;
+  scale: number;
+  __packager_asset: true;
+};
+```
+
+### Default behaviour
+
+The `uri` prop will have a value of an URL that's constructed by joining `publicPath`, 'assets' and the path of the asset relative to the project root together. If `publicPath` is set to https://example.com and the local path to the asset is images/logo.png, then the resulting `uri` value would be: `https://example.com/assets/images/logo.png`.
+
+:::info Scaled assets are fully supported
+
+The asset will resolve to proper scale in runtime by constructing a relevant URL with scale suffix at the end of it.
+
+:::
+
+When you create a production bundle, a directory called `remote-assets` will be included in your project's build directory. This directory contains all of the remote assets that are needed for your application.
+
+By default, the remote-assets directory will be located at `build/generated/<platform>/remote-assets`. However, if you want the remote assets to appear in the `OutputPlugin` directory, which is part of the `RepackPlugin`, you will need to configure an additional property called `auxiliaryAssetsPath`:
+
+```js title="rspack.config.cjs"
+const Repack = require("@callstack/repack");
+const path = require("node:path");
+
+module.exports = (env) => {
+  const { platform } = env;
+
+  return {
+    plugins: [
+      new Repack.RepackPlugin({
+        output: {
+          auxiliaryAssetsPath: path.join("build/output", platform, "remote"),
+        },
+      }),
+    ],
+  };
+};
+```
+
+The final step is to upload your remote assets to your CDN, which is located at `publicPath`, and then host them from that location, which will make them available to users of your app.
+
+### Customizing Asset Path
+
+The `assetPath` option offers finer control over how remote asset paths are constructed. This feature allows you to define a custom function for modifying paths, which can be helpful if you need to apply custom naming conventions or add extra directory layers.
+Specified pattern will be applied to both the generated folder path and URL. If `assetPath` is not provided, the [default behaviour](#default-behaviour) will be used.
+
+Consider the following example:
+
+```js title="rspack.config.cjs"
+const Repack = require("@callstack/repack");
+
+function getCustomAssetPath({ resourceFilename, resourceExtensionType }) {
+  return `my-remote-assets/${resourceFilename}.${resourceExtensionType}`;
+}
+
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: Repack.getAssetExtensionsRegExp(),
+        use: {
+          loader: "@callstack/repack/assets-loader",
+          options: {
+            remote: {
+              enabled: true,
+              publicPath: "http://localhost:9999",
+              assetPath: getCustomAssetPath,
+            },
+          },
+        },
+      },
+    ],
+  },
+};
+```
+
+The configuration above would generate the following paths:
+
+| Property   | Value                                                          |
+| ---------- | -------------------------------------------------------------- |
+| asset path | `<buildFolder>/remote-assets/assets/my-remote-assets/logo.png` |
+| asset URL  | `http://localhost:9999/assets/my-remote-assets/logo.png`       |
+
+:::tip Cache-busting hashes
+
+`assetPath` receives paths, never the contents of the asset, so derive the hash from the file itself if you want the URL to change whenever the file changes:
+
+```js title="rspack.config.cjs"
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+
+function getCustomAssetPath({
+  resourcePath,
+  resourceFilename,
+  resourceExtensionType,
+}) {
+  const hash = crypto
+    .createHash("md5")
+    .update(fs.readFileSync(resourcePath))
+    .digest("hex")
+    .slice(0, 8);
+
+  return `my-remote-assets/${resourceFilename}-${hash}.${resourceExtensionType}`;
+}
+```
+
+`assetPath` is called synchronously, so the file has to be read synchronously too. It is also called once per asset request with the base file: the `@2x` and `@3x` variants reuse the returned path, so the hash only ever describes the base file.
+
+:::

@@ -1,0 +1,102 @@
+import type { IncomingMessage } from 'node:http';
+import type { Socket } from 'node:net';
+import type { FastifyInstance } from 'fastify';
+import { type WebSocket, WebSocketServer as WebSocketServerImpl } from 'ws';
+import type {
+  WebSocketServerInterface,
+  WebSocketServerOptions,
+} from './types.js';
+
+/**
+ * Abstract class for providing common logic (eg routing) for all WebSocket servers.
+ *
+ * @category Development server
+ */
+export abstract class WebSocketServer<T extends WebSocket = WebSocket>
+  implements WebSocketServerInterface
+{
+  /** An instance of the underlying WebSocket server. */
+  protected server: WebSocketServerImpl;
+
+  /** Fastify instance from which {@link server} will receive upgrade connections. */
+  protected fastify: FastifyInstance;
+
+  protected name: string;
+
+  protected paths: string[];
+
+  protected clients: Map<string, T>;
+  protected nextClientId = 0;
+
+  private heartbeatTimer: ReturnType<typeof setInterval>;
+
+  /**
+   * Create a new instance of the WebSocketServer.
+   * Any logging information, will be passed through standard `fastify.log` API.
+   *
+   * @param fastify Fastify instance to which the WebSocket will be attached to.
+   * @param path Path on which this WebSocketServer will be accepting connections.
+   * @param options WebSocketServer options.
+   */
+  constructor(fastify: FastifyInstance, options: WebSocketServerOptions) {
+    this.fastify = fastify;
+    this.name = options.name;
+    this.paths = Array.isArray(options.path) ? options.path : [options.path];
+    this.server = new WebSocketServerImpl({ noServer: true, ...options.wss });
+    this.server.on('connection', this.onConnection.bind(this));
+
+    this.clients = new Map();
+
+    // setup heartbeat timer
+    this.heartbeatTimer = setInterval(() => {
+      this.clients.forEach((socket) => {
+        if (!socket.isAlive) {
+          socket.terminate();
+        } else {
+          socket.isAlive = false;
+          socket.ping(() => {});
+        }
+      });
+    }, 30000);
+
+    this.fastify.addHook('onClose', async () => {
+      clearInterval(this.heartbeatTimer);
+    });
+  }
+
+  shouldUpgrade(pathname: string) {
+    return this.paths.includes(pathname);
+  }
+
+  upgrade(request: IncomingMessage, socket: Socket, head: Buffer) {
+    this.server.handleUpgrade(request, socket, head, (webSocket) => {
+      this.server.emit('connection', webSocket, request);
+    });
+  }
+
+  onConnection(socket: T, _request: IncomingMessage): string {
+    const clientId = `client#${this.nextClientId++}`;
+    this.clients.set(clientId, socket);
+    this.fastify.log.debug({ msg: `${this.name} client connected`, clientId });
+
+    const errorHandler = () => {
+      this.fastify.log.debug({
+        msg: `${this.name} client disconnected`,
+        clientId,
+      });
+      socket.removeAllListeners(); // should we do this?
+      this.clients.delete(clientId);
+    };
+
+    socket.addEventListener('error', errorHandler);
+    socket.addEventListener('close', errorHandler);
+
+    // heartbeat
+    socket.isAlive = true;
+    socket.on('pong', () => {
+      socket.isAlive = true;
+    });
+
+    return clientId;
+  }
+}

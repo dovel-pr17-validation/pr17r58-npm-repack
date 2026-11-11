@@ -1,0 +1,7 @@
+[
+  "assets-loader",
+  "babel-loader",
+  "babel-swc-loader",
+  "flow-loader",
+  "react-refresh-loader"
+]
